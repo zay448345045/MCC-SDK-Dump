@@ -34,3 +34,5 @@ https://github.com/theLlamaNet/halo-ce-android
 兼容性比官方版本好一点点
 任然有一些手机进不去
 https://github.com/Andiweli/HaloCE-Android-AAOS
+https://github.com/zay448345045/MCC-SDK-Dump
+[![Total Downloads](https://img.shields.io/github/downloads/zay448345045/MCC-SDK-Dump/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/zay448345045/MCC-SDK-Dump/releases)
