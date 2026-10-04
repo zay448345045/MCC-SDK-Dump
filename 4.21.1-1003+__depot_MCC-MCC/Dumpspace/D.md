@@ -36,3 +36,11 @@ https://github.com/theLlamaNet/halo-ce-android
 https://github.com/Andiweli/HaloCE-Android-AAOS
 https://github.com/zay448345045/MCC-SDK-Dump
 [![Total Downloads](https://img.shields.io/github/downloads/zay448345045/MCC-SDK-Dump/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/zay448345045/MCC-SDK-Dump/releases)
+[![Total Downloads](https://img.shields.io/github/downloads/cybersecurity/halo-ce-universal/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/cybersecurity/halo-ce-universal/releases)
+[![Total Downloads](https://img.shields.io/github/downloads/thelinkin3000/halo-ce-universal/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/thelinkin3000/halo-ce-universal/releases)
+
+[![Total Downloads](https://img.shields.io/github/downloads/zay448345045/MCC-SDK-Dump/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/zay448345045/MCC-SDK-Dump/releases)
+
+[![Total Downloads](https://img.shields.io/github/downloads/theLlamaNet/halo-ce-android/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/theLlamaNet/halo-ce-android/releases)
+
+[![Total Downloads](https://img.shields.io/github/downloads/Andiweli/HaloCE-Android-AAOS/total?style=for-the-badge&color=2ea44f&logo=github)](https://github.com/Andiweli/HaloCE-Android-AAOS/releases)
