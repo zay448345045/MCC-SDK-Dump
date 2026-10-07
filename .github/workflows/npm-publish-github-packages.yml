@@ -1,31 +1,23 @@
-name: daoheacg Node.js Package
+name: GDrive Release-Driven Stream Pipeline
 
 on:
   workflow_dispatch:
     inputs:
-      file_url:
-        description: '单次或多个链接（支持用逗号 , 或分号 ; 分隔，留空则使用 urls.txt 接力模式）'
+      folder_url:
+        description: 'Google Drive 文件夹总链接（仅第 0 轮初始化时必填，后续接力自动留空）'
         required: false
         type: string
       current_index:
-        description: '接力起始索引 (从第几个开始)'
+        description: '当前处理到第几个文件索引 (从 0 开始)'
         required: true
         default: '0'
-      batch_size:
-        description: '每轮处理的文件数量'
-        required: true
-        default: '50'
-      concurrent_jobs:
-        description: '并发线程数 (建议 4-8)'
-        required: true
-        default: '4'
       volume_size:
         description: '超 2GB 单文件切片大小 (如 1900m)'
         required: false
         default: '1900m'
 
 jobs:
-  harvester:
+  release_driven_pipeline:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -43,370 +35,219 @@ jobs:
           sudo docker image prune --all --force
           df -h /
 
-      - name: 3. 智能解析与准备链接清单及元数据
-        id: prepare
+      - name: 3. 初始化或从 Release 描述中恢复持久化任务清单
+        id: init_task
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
-          SP_COOKIE: ${{ secrets.git }}
         run: |
           mkdir -p download_zone
+          INPUT_URL="${{ github.event.inputs.folder_url }}"
+          START_IDX="${{ github.event.inputs.current_index }}"
           
-          # 1. 提取原始链接列表（支持逗号、分号及换行分隔）
-          if [ -n "${{ github.event.inputs.file_url }}" ]; then
-            echo "启用手动输入模式..."
-            echo "${{ github.event.inputs.file_url }}" | tr ',;' '\n\n' | sed 's/\r//g; /^$/d' > raw_urls.txt
-            RAW_COUNT=$(wc -l < raw_urls.txt)
-            echo "is_relay=false" >> $GITHUB_OUTPUT
-            echo "raw_count=$RAW_COUNT" >> $GITHUB_OUTPUT
+          # 计算当前应该归属于哪一个 Release 组 (每 20 个文件一个 Release)
+          BATCH_GROUP=$((START_IDX / 20))
+          TIMESTAMP=$(date +%Y%m%d)
+          TARGET_TAG="harvest-${TIMESTAMP}-group${BATCH_GROUP}"
+          
+          echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+
+          # 情况 A：第一轮初始化（用户输入了文件夹总链接）
+          if [ -n "$INPUT_URL" ]; then
+            echo "📁 检测到文件夹总链接，正在云端递归提取所有分卷文件清单..."
+            pip install --no-cache-dir gdown > /dev/null 2>&1
+            
+            python3 -c "
+            import gdown, sys
+            url = '$INPUT_URL'
+            try:
+                links = gdown.crawl_url(url)
+                if not links:
+                    links = [url]
+                with open('urls.txt', 'w') as f:
+                    for l in links:
+                        f.write(l.strip() + '\n')
+                print(f'✅ 成功解析，共获取 {len(links)} 个文件。')
+            except Exception as e:
+                print(f'⚠️ 解析异常: {e}，作为单链接写入...')
+                with open('urls.txt', 'w') as f:
+                    f.write(url + '\n')
+            "
+            
+            # 读取生成的清单内容
+            URLS_CONTENT=$(cat urls.txt)
+            
+            # 格式化并持久化写入 Release 描述中（用特殊的 Markdown 代码块包裹，供后续读取）
+            RELEASE_BODY="🚀 **Google Drive 自动化云端持久化归档流水线**\n\n- 状态: 运行中\n- 总任务源: $INPUT_URL\n\n### 📌 持久化任务清单 (URL Database):\n\`\`\`urls\n$URLS_CONTENT\n\`\`\`"
+            
+            if ! gh release view "$TARGET_TAG" &>/dev/null; then
+              gh release create "$TARGET_TAG" --title "GDrive 归档组 - 组 $BATCH_GROUP" --notes "$RELEASE_BODY"
+            else
+              gh release edit "$TARGET_TAG" --notes "$RELEASE_BODY"
+            fi
+            
           else
-            echo "启用 urls.txt 接力模式..."
-            if [ ! -f "urls.txt" ]; then
-              echo "❌ 错误: 仓库根目录未找到 urls.txt 文件！"
+            # 情况 B：接力轮（没有输入总链接，直接从历史或当前 Release 描述中反向提取 urls 清单）
+            echo "🔄 接力模式：正在从 Release ($TARGET_TAG) 描述中提取持久化任务清单..."
+            
+            if ! gh release view "$TARGET_TAG" &>/dev/null; then
+              echo "❌ 错误: 找不到对应的 Release ($TARGET_TAG)，请检查索引或重新初始化！"
               exit 1
             fi
-            sed -i 's/[;,]/\n/g; s/\r//g; /^$/d' urls.txt
-            START=${{ github.event.inputs.current_index }}
-            SIZE=${{ github.event.inputs.batch_size }}
             
-            sed -n "$((START+1)),$((START+SIZE))p" urls.txt > raw_urls.txt
-            RAW_COUNT=$(wc -l < raw_urls.txt)
-            echo "is_relay=true" >> $GITHUB_OUTPUT
-            echo "raw_count=$RAW_COUNT" >> $GITHUB_OUTPUT
+            # 通过 GitHub API 提取 Release Notes，并用 Python 从 ```urls 代码块中精准反序列化
+            gh release view "$TARGET_TAG" --json body --jq '.body' > release_notes.md
+            
+            python3 -c "
+            import re
+            with open('release_notes.md', 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            match = re.search(r'\`\`\`urls\s*(.*?)\s*\`\``', content, re.DOTALL)
+            if match:
+                urls_data = match.group(1).strip()
+                with open('urls.txt', 'w', encoding='utf-8') as out:
+                    out.write(urls_data + '\n')
+                print('✅ 成功从 Release 描述中恢复持久化任务清单！')
+            else:
+                print('❌ 错误: 无法从 Release 描述中找到 ```urls 代码块！')
+                sys.exit(1)
+            "
           fi
 
-          # 2. 智能解析并提取完整 Release 说明
-          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" << 'EOF'
-            import sys, re, json, subprocess, urllib.parse
+          TOTAL_COUNT=$(wc -l < urls.txt)
+          echo "total_count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
+          echo "📊 当前任务清单总文件数: $TOTAL_COUNT"
 
-            def resolve_url(line):
-                line = line.strip()
-                if not line: return []
-
-                if "/releases/download/" in line:
-                    gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+)", line)
-                    repo_str = f"{gh_match.group(1)}/{gh_match.group(2).replace('.git','')}" if gh_match else "直链"
-                    clean_filename = urllib.parse.unquote(line.split('/')[-1].split('?')[0])
-                    return [{
-                        "download_url": line,
-                        "repo": repo_str,
-                        "tag": "Direct Link",
-                        "title": clean_filename,
-                        "notes": "GitHub 直链附件，未通过 API 匹配完整 Release Notes"
-                    }]
-
-                gh_match = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/releases.*)?", line)
-                if gh_match:
-                    owner = gh_match.group(1)
-                    repo = gh_match.group(2).replace(".git", "")
-                    tag_match = re.search(r"/releases/tag/([^/]+)", line)
-                    
-                    try:
-                        jq_filter = '{tag: .tag_name, name: (.name // .tag_name), body: (.body // ""), assets: [.assets[].browser_download_url]}'
-                        if tag_match:
-                            tag = tag_match.group(1)
-                            cmd = ["gh", "api", f"repos/{owner}/{repo}/releases/tags/{tag}", "--jq", jq_filter]
-                            res = subprocess.check_output(cmd, text=True).strip()
-                            rel_data = [json.loads(res)] if res else []
-                        else:
-                            cmd = ["gh", "api", f"repos/{owner}/{repo}/releases", "--paginate", "--jq", jq_filter]
-                            res = subprocess.check_output(cmd, text=True).strip()
-                            rel_data = [json.loads(line) for line in res.splitlines() if line.strip()]
-                        
-                        results = []
-                        for rel in rel_data:
-                            t_name = rel.get("tag") or "N/A"
-                            title = rel.get("name") or t_name
-                            notes = rel.get("body") or "无详细说明"
-                            assets = rel.get("assets") or []
-                            for asset_url in assets:
-                                results.append({
-                                    "download_url": asset_url,
-                                    "repo": f"{owner}/{repo}",
-                                    "tag": t_name,
-                                    "title": title,
-                                    "notes": notes
-                                })
-                        return results if results else [{
-                            "download_url": line,
-                            "repo": f"{owner}/{repo}",
-                            "tag": "N/A",
-                            "title": "N/A",
-                            "notes": "未提取到有效 Asset"
-                        }]
-                    except Exception as e:
-                        print(f"⚠️ 解析 API 失败，作为普通链接处理: {e}", file=sys.stderr)
-                        return [{
-                            "download_url": line,
-                            "repo": f"{owner}/{repo}",
-                            "tag": "N/A",
-                            "title": "N/A",
-                            "notes": f"解析失败: {str(e)}"
-                        }]
-
-                clean_filename = urllib.parse.unquote(line.split('/')[-1].split('?')[0])
-                return [{
-                    "download_url": line,
-                    "repo": "第三方直链/GitCode",
-                    "tag": "N/A",
-                    "title": clean_filename,
-                    "notes": f"非 GitHub 官方链接，原始 URL: {line}"
-                }]
-
-            with open("raw_urls.txt", "r") as f:
-                lines = f.readlines()
-
-            final_batch = []
-            for line in lines:
-                final_batch.extend(resolve_url(line))
-
-            with open("current_batch.json", "w", encoding="utf-8") as f:
-                json.dump(final_batch, f, ensure_ascii=False, indent=2)
-
-            with open("current_batch.txt", "w", encoding="utf-8") as f:
-                for item in final_batch:
-                    f.write(item["download_url"] + "\n")
-          EOF
-
-          TOTAL=$(wc -l < current_batch.txt)
-          TOTAL_FILE=$(wc -l < urls.txt 2>/dev/null || echo 1)
-          
-          echo "total=$TOTAL_FILE" >> $GITHUB_OUTPUT
-          echo "💡 本轮解析出待处理文件共 $TOTAL 条"
-
-      - name: 4. 创建全新的独立 Release
-        id: create_release
+      - name: 4. 串行流式处理当前单个文件 (JIT 鉴权 + 7z 切片 + 传完即删)
+        id: worker_single
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
         run: |
-          START=${{ github.event.inputs.current_index }}
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          NEW_TAG="harvest-${TIMESTAMP}-idx${START}"
-          
-          echo "📦 创建全新 Release: $NEW_TAG"
-          gh release create "$NEW_TAG" \
-            --title "资源采集库 - $NEW_TAG" \
-            --notes "🚀 采集任务启动，正在生成说明文档与下载文件..."
-          
-          echo "release_tag=$NEW_TAG" >> $GITHUB_OUTPUT
-
-      - name: 5. 多线程并发下载、自动切片上传并生成说明
-        id: worker
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
-          SP_COOKIE: ${{ secrets.daoheacg }}
-        run: |
-          TARGET_TAG="${{ steps.create_release.outputs.release_tag }}"
           START_IDX=${{ github.event.inputs.current_index }}
-          WORKERS=${{ github.event.inputs.concurrent_jobs }}
+          TOTAL_COUNT=${{ steps.init_task.outputs.total_count }}
+          TARGET_TAG="${{ steps.init_task.outputs.target_tag }}"
           VOL_SIZE="${{ github.event.inputs.volume_size }}"
-          RAW_COUNT=${{ steps.prepare.outputs.raw_count }}
-
-          python3 -c "import sys, textwrap; exec(textwrap.dedent(sys.stdin.read()))" "$TARGET_TAG" "$START_IDX" "$WORKERS" "$VOL_SIZE" << 'EOF'
-            import os, sys, re, json, urllib.parse, subprocess, threading, time, shutil
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            target_tag = sys.argv[1]
-            start_idx = sys.argv[2]
-            max_workers = int(sys.argv[3])
-            volume_size = sys.argv[4]
-            dl_dir = os.path.abspath("download_zone")
-            sp_cookie = os.environ.get("SP_COOKIE", "").strip()
-
-            if not os.path.exists("current_batch.json"):
-                sys.exit(0)
-
-            with open("current_batch.json", "r", encoding="utf-8") as f:
-                batch_items = json.load(f)
-
-            total = len(batch_items)
-            lock = threading.Lock()
-            processed_records = []
-
-            def worker_task(item_data):
-                idx, item = item_data
-                url = item["download_url"]
-
-                # 磁盘空间监控 (低于 5GB 触发保护)
-                free_mb = shutil.disk_usage(dl_dir).free / (1024 * 1024)
-                if free_mb < 5120:
-                    print(f"⚠️ [{idx+1}/{total}] 磁盘容量不足 5GB ({free_mb:.0f}MB)，熔断并跳过此任务: {url}")
-                    with lock:
-                        processed_records.append({
-                            "idx": idx, "unique_name": "N/A", "raw_filename": url,
-                            "repo": item.get("repo", "N/A"), "tag": item.get("tag", "N/A"),
-                            "title": item.get("title", "N/A"), "notes": item.get("notes", "无说明"),
-                            "status": "跳过(磁盘熔断)", "url": url
-                        })
-                    return
-
-                raw_filename = urllib.parse.unquote(url.split('/')[-1].split('?')[0])
-                safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', raw_filename)
-                safe_name = re.sub(r'_+', '_', safe_name).strip('_')
-                if not safe_name or safe_name == '.':
-                    safe_name = f"file_{start_idx}_{idx}.bin"
-
-                unique_name = f"{start_idx}_{idx}_{safe_name}"
-                local_path = os.path.join(dl_dir, unique_name)
-
-                print(f"🚀 [{idx+1}/{total}] 开始下载: {unique_name}")
-
-                curl_cmd = [
-                    "curl", "-L", "-A", "Mozilla/5.0",
-                    "--retry", "5", "--retry-delay", "3", "--fail",
-                    "-s", "-S"
-                ]
-                if sp_cookie:
-                    curl_cmd.extend(["-H", f"Cookie: {sp_cookie}"])
-                curl_cmd.extend([url, "-o", local_path])
-                
-                res = subprocess.run(curl_cmd)
-                status = "失败"
-
-                if res.returncode == 0 and os.path.exists(local_path):
-                    file_size = os.path.getsize(local_path)
-                    max_bytes = 1900 * 1024 * 1024  # 1.9GB 阀值
-                    files_to_upload = []
-
-                    # 触发 7z 快速分卷打包逻辑 (-mx0 不做 CPU 压缩，只进行切割)
-                    if file_size > max_bytes:
-                        print(f"📦 [{idx+1}/{total}] {unique_name} 大小为 {file_size/1024/1024:.2f}MB (超出 2GB 限制)，开启 7z 切片 (-v{volume_size})...")
-                        archive_base = os.path.join(dl_dir, f"{unique_name}.7z")
-                        split_cmd = ["7z", "a", f"-v{volume_size}", "-mx0", archive_base, local_path]
-                        split_res = subprocess.run(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                        
-                        if split_res.returncode == 0:
-                            os.remove(local_path) # 删除原超大文件
-                            parent_dir = os.path.dirname(archive_base)
-                            base_name = os.path.basename(archive_base)
-                            files_to_upload = [
-                                os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
-                                if f == base_name or f.startswith(f"{base_name}.")
-                            ]
-                            files_to_upload.sort()
-                        else:
-                            print(f"⚠️ [{idx+1}/{total}] 7z 分卷失败，尝试直接上传原文件...")
-                            files_to_upload = [local_path]
-                    else:
-                        files_to_upload = [local_path]
-
-                    # 批量上传切片或单独文件
-                    upload_success = True
-                    for upload_file in files_to_upload:
-                        fname = os.path.basename(upload_file)
-                        print(f"⬆️ [{idx+1}/{total}] 上传至 Release: {fname}")
-                        up_ok = False
-                        for attempt in range(3):
-                            up_cmd = ["gh", "release", "upload", target_tag, upload_file, "--clobber"]
-                            if subprocess.run(up_cmd).returncode == 0:
-                                up_ok = True
-                                break
-                            time.sleep(2)
-                        
-                        if os.path.exists(upload_file):
-                            os.remove(upload_file)
-                            
-                        if not up_ok:
-                            upload_success = False
-
-                    if upload_success:
-                        print(f"✅ [{idx+1}/{total}] 成功处理: {unique_name}")
-                        status = "成功"
-                    else:
-                        print(f"⚠️ [{idx+1}/{total}] 上传存在失败项: {unique_name}")
-                else:
-                    print(f"⚠️ [{idx+1}/{total}] 下载失败: {url}")
-
-                record = {
-                    "idx": idx,
-                    "unique_name": unique_name,
-                    "raw_filename": raw_filename,
-                    "repo": item.get("repo", "N/A"),
-                    "tag": item.get("tag", "N/A"),
-                    "title": item.get("title", "N/A"),
-                    "notes": item.get("notes", "无说明"),
-                    "status": status,
-                    "url": url
-                }
-
-                with lock:
-                    processed_records.append(record)
-
-            print(f"⚡ 启动多线程流水线，并发数: {max_workers}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(worker_task, (i, item)) for i, item in enumerate(batch_items)]
-                for future in as_completed(futures):
-                    pass
-
-            processed_records.sort(key=lambda x: x["idx"])
-
-            summary_lines = [
-                f"# 📦 资源采集库归档清单 ({target_tag})",
-                "",
-                "| 归档文件名 | 来源仓库 | 版本 Tag | 状态 |",
-                "| :--- | :--- | :--- | :--- |"
-            ]
-
-            details_lines = [
-                "",
-                "---",
-                "## 📝 各文件对应发行版说明 (Release Notes)",
-                ""
-            ]
-
-            for r in processed_records:
-                summary_lines.append(f"| `{r['unique_name']}` | `{r['repo']}` | `{r['tag']}` | {r['status']} |")
-                
-                notes_clean = r['notes'].strip()
-                if len(notes_clean) > 2000:
-                    notes_display = notes_clean[:2000] + "\n\n*(说明内容过长，已被自动截断...)*"
-                else:
-                    notes_display = notes_clean if notes_clean else "*(无发行版说明)*"
-
-                details_lines.append("<details>")
-                details_lines.append(f"<summary><b>🔍 {r['unique_name']} ({r['repo']} @ {r['tag']})</b></summary>\n")
-                details_lines.append(f"- **原始文件名:** `{r['raw_filename']}`")
-                details_lines.append(f"- **发行版标题:** {r['title']}")
-                details_lines.append(f"- **来源仓库:** `{r['repo']}`")
-                details_lines.append(f"- **版本 Tag:** `{r['tag']}`\n")
-                details_lines.append("#### 详细说明:\n")
-                details_lines.append(f"{notes_display}\n")
-                details_lines.append("</details>\n")
-
-            full_md = "\n".join(summary_lines + details_lines)
-
-            notes_file_path = os.path.join(dl_dir, "00_RELEASE_NOTES.md")
-            with open(notes_file_path, "w", encoding="utf-8") as f:
-                f.write(full_md)
-
-            with open("RELEASE_SUMMARY.md", "w", encoding="utf-8") as f:
-                f.write(full_md[:120000])
-
-            print("📄 正在上传 00_RELEASE_NOTES.md 附件...")
-            subprocess.run(["gh", "release", "upload", target_tag, notes_file_path, "--clobber"])
-
-            print("🎉 本轮并发任务全部结束！")
-          EOF
-
-          # 更新当前 Release Body
-          gh release edit "$TARGET_TAG" -F RELEASE_SUMMARY.md 2>/dev/null || true
-
-          ACTUAL_NEXT=$((START_IDX + RAW_COUNT))
-          echo "next_idx=$ACTUAL_NEXT" >> $GITHUB_OUTPUT
-
-          if [ "${{ steps.prepare.outputs.is_relay }}" == "true" ] && [ $ACTUAL_NEXT -lt ${{ steps.prepare.outputs.total }} ]; then
-             echo "should_relay=true" >> $GITHUB_OUTPUT
-          else
-             echo "should_relay=false" >> $GITHUB_OUTPUT
+          
+          if [ $START_IDX -ge $TOTAL_COUNT ]; then
+            echo "🎉 所有几百GB文件已全部顺利搬运完成！"
+            echo "is_finished=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
+          
+          # 精准读取当前索引对应的单个文件链接
+          CURRENT_URL=$(sed -n "$((START_IDX + 1))p" urls.txt | tr -d '\r')
+          echo "🎯 正在云端流式处理第 $((START_IDX + 1)) / $TOTAL_COUNT 个文件: $CURRENT_URL"
+          
+          # 执行单文件流式 Python 核心搬运脚本
+          python3 -c "
+          import os, re, subprocess, urllib.parse, sys
+          
+          url = '$CURRENT_URL'
+          target_tag = '$TARGET_TAG'
+          vol_size = '$VOL_SIZE'
+          dl_dir = os.path.abspath('download_zone')
+          
+          # 1. 实时提取 Google Drive File ID 并执行 JIT 实时鉴权（绕过病毒拦截）
+          file_id_match = re.search(r'(?:file/d/|uc\?id=)([a-zA-Z0-9_-]+)', url)
+          if not file_id_match:
+              file_id = 'direct_file_' + str(abs(hash(url))[:8])
+              uc_url = url
+          else:
+              file_id = file_id_match.group(1)
+              uc_url = f'https://docs.google.com/uc?export=download&id={file_id}'
+          
+          print('🔄 正在实时获取 Google Drive 鉴权与下载确认令牌 (JIT 实时鉴权)...')
+          tmp_cookie = f'/tmp/cookie_{file_id}.txt'
+          
+          get_cmd = ['wget', '--save-cookies', tmp_cookie, '--keep-session-cookies', '--no-check-certificate', '-qO-', uc_url]
+          res = subprocess.run(get_cmd, capture_output=True, text=True)
+          
+          confirm_m = re.search(r'confirm=([0-9A-Za-z_]+)', res.stdout)
+          if confirm_m:
+              confirm_code = confirm_m.group(1)
+              final_url = f'https://docs.google.com/uc?export=download&confirm={confirm_code}&id={file_id}'
+          else:
+              final_url = uc_url
+              
+          local_path = os.path.join(dl_dir, f'gdrive_{file_id}.bin')
+          
+          print(f'🚀 开始实时下载分卷文件...')
+          dl_cmd = ['wget', '--load-cookies', tmp_cookie, '--no-check-certificate', '-O', local_path, final_url]
+          dl_res = subprocess.run(dl_cmd)
+          
+          if os.path.exists(tmp_cookie):
+              os.remove(tmp_cookie)
+              
+          if dl_res.returncode != 0 or not os.path.exists(local_path):
+              print('❌ 下载失败！')
+              sys.exit(1)
+              
+          file_size = os.path.getsize(local_path)
+          print(f'✅ 下载成功，当前分卷大小: {file_size / 1024 / 1024:.2f} MB')
+          
+          # 2. 超过 1.9GB 自动进行 7z 仅存储不压缩 (-mx0) 切片
+          max_bytes = 1900 * 1024 * 1024
+          files_to_upload = []
+          
+          if file_size > max_bytes:
+              print(f'📦 文件超过 1.9GB 限制，启动 7z 快速切片 (-v{vol_size}, -mx0 仅存储)...')
+              archive_base = os.path.join(dl_dir, f'archive_{file_id}.7z')
+              split_cmd = ['7z', 'a', f'-v{vol_size}', '-mx0', archive_base, local_path]
+              split_res = subprocess.run(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              
+              if split_res.returncode == 0:
+                  os.remove(local_path) # 立即删除原大文件释放本地磁盘
+                  parent_dir = os.path.dirname(archive_base)
+                  base_name = os.path.basename(archive_base)
+                  files_to_upload = [
+                      os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                      if f == base_name or f.startswith(f'{base_name}.')
+                  ]
+                  files_to_upload.sort()
+              else:
+                  print('⚠️ 7z 切片失败，尝试直接上传原文件...')
+                  files_to_upload = [local_path]
+          else:
+              files_to_upload = [local_path]
+              
+          # 3. 逐个流式上传至 Release 并在上传成功后立即删除切片文件
+          for up_file in files_to_upload:
+              fname = os.path.basename(up_file)
+              print(f'⬆️ 正在流式上传到 Release ({target_tag}): {fname}')
+              
+              up_ok = False
+              for attempt in range(3):
+                  up_cmd = ['gh', 'release', 'upload', target_tag, up_file, '--clobber']
+                  if subprocess.run(up_cmd).returncode == 0:
+                      up_ok = True
+                      break
+                  print(f'⚠️ 上传重试中 ({attempt+1}/3)...')
+                  
+              if os.path.exists(up_file):
+                  os.remove(up_file) # 传完立刻删除，绝对不爆盘
+                  
+              if not up_ok:
+                  print(f'❌ 文件切片 {fname} 上传失败！')
+                  sys.exit(1)
+                  
+          print(f'🎉 当前分卷流式处理完毕并已彻底清理本地硬盘！')
+          "
+          
+          NEXT_IDX=$((START_IDX + 1))
+          echo "next_idx=$NEXT_IDX" >> $GITHUB_OUTPUT
+          echo "is_finished=false" >> $GITHUB_OUTPUT
 
-      - name: 6. 自动触发下一轮接力
-        if: success() && steps.worker.outputs.should_relay == 'true'
+      - name: 5. 自动触发下一轮循环接力
+        if: success() && steps.worker_single.outputs.is_finished != 'true'
         run: |
-          echo "🏁 本轮完成，下一站索引: ${{ steps.worker.outputs.next_idx }}"
+          NEXT_IDX=${{ steps.worker_single.outputs.next_idx }}
+          TOTAL_COUNT=${{ steps.init_task.outputs.total_count }}
+          
+          echo "🏁 当前文件处理完毕。准备无缝递归触发下一个文件 (进度: $NEXT_IDX / $TOTAL_COUNT)..."
+          
+          # 接力时注意：不需要再传 folder_url，脚本会自动从 Release 描述中读取持久化清单
           gh workflow run "${{ github.workflow }}" \
-            -f current_index=${{ steps.worker.outputs.next_idx }} \
-            -f batch_size=${{ github.event.inputs.batch_size }} \
-            -f concurrent_jobs=${{ github.event.inputs.concurrent_jobs }} \
-            -f volume_size=${{ github.event.inputs.volume_size }}
+            -f current_index=$NEXT_IDX \
+            -f volume_size="${{ github.event.inputs.volume_size }}"
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
