@@ -1,4 +1,4 @@
-name: GDrive Release-Driven Stream Pipeline
+name: GDrive Release-Driven Stream Pipeline (Self-Healing)
 
 on:
   workflow_dispatch:
@@ -29,8 +29,10 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: 2. 磁盘清理
+      - name: 2. 记录启动时间戳 (用于 6 小时硬超时防断保护)
+        id: time_guard
         run: |
+          echo "start_epoch=$(date +%s)" >> $GITHUB_OUTPUT
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
           sudo docker image prune --all --force
           df -h /
@@ -44,14 +46,12 @@ jobs:
           INPUT_URL="${{ github.event.inputs.folder_url }}"
           START_IDX="${{ github.event.inputs.current_index }}"
           
-          # 计算当前应该归属于哪一个 Release 组 (每 20 个文件一个 Release)
           BATCH_GROUP=$((START_IDX / 20))
           TIMESTAMP=$(date +%Y%m%d)
           TARGET_TAG="harvest-${TIMESTAMP}-group${BATCH_GROUP}"
           
           echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
 
-          # 情况 A：第一轮初始化（用户输入了文件夹总链接）
           if [ -n "$INPUT_URL" ]; then
             echo "📁 检测到文件夹总链接，正在云端递归提取所有分卷文件清单..."
             pip install --no-cache-dir gdown > /dev/null 2>&1
@@ -73,10 +73,7 @@ jobs:
                     f.write(url + '\n')
             "
             
-            # 读取生成的清单内容
             URLS_CONTENT=$(cat urls.txt)
-            
-            # 格式化并持久化写入 Release 描述中（用特殊的 Markdown 代码块包裹，供后续读取）
             RELEASE_BODY="🚀 **Google Drive 自动化云端持久化归档流水线**\n\n- 状态: 运行中\n- 总任务源: $INPUT_URL\n\n### 📌 持久化任务清单 (URL Database):\n\`\`\`urls\n$URLS_CONTENT\n\`\`\`"
             
             if ! gh release view "$TARGET_TAG" &>/dev/null; then
@@ -86,7 +83,6 @@ jobs:
             fi
             
           else
-            # 情况 B：接力轮（没有输入总链接，直接从历史或当前 Release 描述中反向提取 urls 清单）
             echo "🔄 接力模式：正在从 Release ($TARGET_TAG) 描述中提取持久化任务清单..."
             
             if ! gh release view "$TARGET_TAG" &>/dev/null; then
@@ -94,7 +90,6 @@ jobs:
               exit 1
             fi
             
-            # 通过 GitHub API 提取 Release Notes，并用 Python 从 ```urls 代码块中精准反序列化
             gh release view "$TARGET_TAG" --json body --jq '.body' > release_notes.md
             
             python3 -c "
@@ -118,7 +113,7 @@ jobs:
           echo "total_count=$TOTAL_COUNT" >> $GITHUB_OUTPUT
           echo "📊 当前任务清单总文件数: $TOTAL_COUNT"
 
-      - name: 4. 串行流式处理当前单个文件 (JIT 鉴权 + 7z 切片 + 传完即删)
+      - name: 4. 智能串行流式处理（含 5 小时硬超时主动安全退出机制）
         id: worker_single
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
@@ -127,18 +122,32 @@ jobs:
           TOTAL_COUNT=${{ steps.init_task.outputs.total_count }}
           TARGET_TAG="${{ steps.init_task.outputs.target_tag }}"
           VOL_SIZE="${{ github.event.inputs.volume_size }}"
+          START_EPOCH=${{ steps.time_guard.outputs.start_epoch }}
           
           if [ $START_IDX -ge $TOTAL_COUNT ]; then
             echo "🎉 所有几百GB文件已全部顺利搬运完成！"
             echo "is_finished=true" >> $GITHUB_OUTPUT
+            echo "timeout_exit=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          # 精准读取当前索引对应的单个文件链接
+          # 【核心防断机制】检查当前已运行时间。如果超过 5 小时 (18000秒)，主动安全退出并接力！
+          CURRENT_EPOCH=$(date +%s)
+          ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
+          SAFE_LIMIT=18000 # 5 小时安全阈值 (GitHub 6小时硬上限)
+          
+          if [ $ELAPSED -gt $SAFE_LIMIT ]; then
+            echo "⚠️ 警报: 当前 Job 已运行 $((ELAPSED / 3600)) 小时，接近 GitHub 6小时硬超时限制！"
+            echo "🛑 为防止被强行杀死导致断档，脚本主动触发平稳安全退出，准备无缝续航接力..."
+            echo "next_idx=$START_IDX" >> $GITHUB_OUTPUT
+            echo "is_finished=false" >> $GITHUB_OUTPUT
+            echo "timeout_exit=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
           CURRENT_URL=$(sed -n "$((START_IDX + 1))p" urls.txt | tr -d '\r')
           echo "🎯 正在云端流式处理第 $((START_IDX + 1)) / $TOTAL_COUNT 个文件: $CURRENT_URL"
           
-          # 执行单文件流式 Python 核心搬运脚本
           python3 -c "
           import os, re, subprocess, urllib.parse, sys
           
@@ -147,14 +156,13 @@ jobs:
           vol_size = '$VOL_SIZE'
           dl_dir = os.path.abspath('download_zone')
           
-          # 1. 实时提取 Google Drive File ID 并执行 JIT 实时鉴权（绕过病毒拦截）
           file_id_match = re.search(r'(?:file/d/|uc\?id=)([a-zA-Z0-9_-]+)', url)
           if not file_id_match:
               file_id = 'direct_file_' + str(abs(hash(url))[:8])
               uc_url = url
           else:
               file_id = file_id_match.group(1)
-              uc_url = f'https://docs.google.com/uc?export=download&id={file_id}'
+              uc_url = f'[https://docs.google.com/uc?export=download&id=](https://docs.google.com/uc?export=download&id=){file_id}'
           
           print('🔄 正在实时获取 Google Drive 鉴权与下载确认令牌 (JIT 实时鉴权)...')
           tmp_cookie = f'/tmp/cookie_{file_id}.txt'
@@ -165,7 +173,7 @@ jobs:
           confirm_m = re.search(r'confirm=([0-9A-Za-z_]+)', res.stdout)
           if confirm_m:
               confirm_code = confirm_m.group(1)
-              final_url = f'https://docs.google.com/uc?export=download&confirm={confirm_code}&id={file_id}'
+              final_url = f'[https://docs.google.com/uc?export=download&confirm=](https://docs.google.com/uc?export=download&confirm=){confirm_code}&id={file_id}'
           else:
               final_url = uc_url
               
@@ -185,7 +193,6 @@ jobs:
           file_size = os.path.getsize(local_path)
           print(f'✅ 下载成功，当前分卷大小: {file_size / 1024 / 1024:.2f} MB')
           
-          # 2. 超过 1.9GB 自动进行 7z 仅存储不压缩 (-mx0) 切片
           max_bytes = 1900 * 1024 * 1024
           files_to_upload = []
           
@@ -196,7 +203,7 @@ jobs:
               split_res = subprocess.run(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
               
               if split_res.returncode == 0:
-                  os.remove(local_path) # 立即删除原大文件释放本地磁盘
+                  os.remove(local_path)
                   parent_dir = os.path.dirname(archive_base)
                   base_name = os.path.basename(archive_base)
                   files_to_upload = [
@@ -210,7 +217,6 @@ jobs:
           else:
               files_to_upload = [local_path]
               
-          # 3. 逐个流式上传至 Release 并在上传成功后立即删除切片文件
           for up_file in files_to_upload:
               fname = os.path.basename(up_file)
               print(f'⬆️ 正在流式上传到 Release ({target_tag}): {fname}')
@@ -224,7 +230,7 @@ jobs:
                   print(f'⚠️ 上传重试中 ({attempt+1}/3)...')
                   
               if os.path.exists(up_file):
-                  os.remove(up_file) # 传完立刻删除，绝对不爆盘
+                  os.remove(up_file)
                   
               if not up_ok:
                   print(f'❌ 文件切片 {fname} 上传失败！')
@@ -236,16 +242,21 @@ jobs:
           NEXT_IDX=$((START_IDX + 1))
           echo "next_idx=$NEXT_IDX" >> $GITHUB_OUTPUT
           echo "is_finished=false" >> $GITHUB_OUTPUT
+          echo "timeout_exit=false" >> $GITHUB_OUTPUT
 
-      - name: 5. 自动触发下一轮循环接力
+      - name: 5. 自动触发下一轮循环接力 (含超时自救触发)
         if: success() && steps.worker_single.outputs.is_finished != 'true'
         run: |
           NEXT_IDX=${{ steps.worker_single.outputs.next_idx }}
           TOTAL_COUNT=${{ steps.init_task.outputs.total_count }}
+          TIMEOUT_EXIT=${{ steps.worker_single.outputs.timeout_exit }}
           
-          echo "🏁 当前文件处理完毕。准备无缝递归触发下一个文件 (进度: $NEXT_IDX / $TOTAL_COUNT)..."
+          if [ "$TIMEOUT_EXIT" = "true" ]; then
+            echo "⏱️ 触发超时自救！当前停留在索引: $NEXT_IDX / $TOTAL_COUNT，正在重新排队开启新 Job 接力..."
+          else
+            echo "🏁 当前文件处理完毕。准备无缝递归触发下一个文件 (进度: $NEXT_IDX / $TOTAL_COUNT)..."
+          fi
           
-          # 接力时注意：不需要再传 folder_url，脚本会自动从 Release 描述中读取持久化清单
           gh workflow run "${{ github.workflow }}" \
             -f current_index=$NEXT_IDX \
             -f volume_size="${{ github.event.inputs.volume_size }}"
